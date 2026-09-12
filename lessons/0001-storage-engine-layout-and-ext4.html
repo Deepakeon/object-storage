@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Lesson 0001: Storage Engine Layout & Linux ext4 Internals</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <span class="lesson-tag">Lesson 0001 &bull; Core Storage Architecture</span>
+      <h1>Storage Engine Layout &amp; Linux ext4 Internals</h1>
+      <p class="subtitle">Understanding POSIX filesystems, ext4 limits, cryptographic hash addressing, and MIME decoupling in ADR 0001.</p>
+    </header>
+
+    <div class="callout">
+      <div class="callout-title">Primary Recommended Reading</div>
+      <p>Before diving into future distributed storage layers, read the canonical source on ext4 directory indexing: <a href="https://www.kernel.org/doc/html/latest/filesystems/ext4/directory.html" target="_blank">Linux Kernel Documentation: ext4 Directory Indexing</a> and the Git loose object format in <a href="https://git-scm.com/docs/gitrepository-layout" target="_blank">gitrepository-layout(5)</a>.</p>
+    </div>
+
+    <h2>1. What is a POSIX Filesystem?</h2>
+    <p><strong>POSIX</strong> (Portable Operating System Interface) is a family of IEEE standards defining how Unix-like operating systems (Linux, macOS, BSD) must behave. A POSIX filesystem specifies how files, directories, permissions, and system calls interact.</p>
+    
+    <p>In a POSIX filesystem:</p>
+    <ul>
+      <li>Everything is organized into a <strong>hierarchical tree</strong> starting at root (<code>/</code>).</li>
+      <li>Data files and directories are tracked by <strong>inodes</strong> (index nodes) that store file metadata (size, permissions, timestamps, block pointers).</li>
+      <li>Directories are special files containing lists of names pointing to inode numbers.</li>
+      <li>Standard system calls (<code>open()</code>, <code>read()</code>, <code>write()</code>, <code>unlink()</code>, <code>rename()</code>) govern all operations.</li>
+    </ul>
+
+    <div class="callout danger">
+      <div class="callout-title">The S3 vs POSIX Impedance Mismatch</div>
+      <p>In Amazon S3, there is <em>no real directory hierarchy</em>. Keys are just arbitrary UTF-8 strings. S3 allows an object named <code>photos</code> and an object named <code>photos/beach.png</code> to exist simultaneously. But on a POSIX filesystem, a single path component <strong>cannot simultaneously be a regular file and a directory</strong>! Attempting to create a file where a directory exists triggers <code>EISDIR</code>, and vice versa triggers <code>ENOTDIR</code>. Furthermore, raw S3 keys can contain <code>../../</code> or null bytes (<code>\0</code>), creating lethal path traversal security vulnerabilities (CWE-22) if passed directly to POSIX system calls.</p>
+    </div>
+
+    <h2>2. What is ext4?</h2>
+    <p><strong>ext4</strong> (Fourth Extended Filesystem) is the standard, rock-solid default journaled filesystem used by modern Linux distributions (including Ubuntu, Debian, CentOS/RHEL, and Android). It divides physical disk storage into fixed-size chunks called <strong>blocks</strong> (almost universally <strong>4,096 bytes / 4 KB</strong>).</p>
+
+    <p>When you create an ext4 filesystem:</p>
+    <ol>
+      <li>A fixed pool of <strong>inodes</strong> is allocated.</li>
+      <li>Directory entries (represented by <code>struct ext4_dir_entry_2</code>) map human-readable names to inode numbers.</li>
+      <li>Each entry has an 8-byte header plus the filename bytes, padded to 4-byte boundaries.</li>
+    </ol>
+
+    <h2>3. ext4 Limits &amp; Directory Scaling in Layman Terms</h2>
+
+    <div class="callout analogy">
+      <div class="callout-title">The Layman Analogy: The Giant Cardboard Box vs. The 2-Tier Filing Cabinet</div>
+      <p>Imagine you have 1,000,000 papers to store. If you dump all 1,000,000 papers into <strong>one single giant cardboard box</strong> (a flat directory):</p>
+      <ul>
+        <li>Every time you want to find a paper, you must dig through a massive pile. Even with an index, the index is so large it overflows your desk.</li>
+        <li><strong>Hash Collisions:</strong> ext4 tries to help you by creating a short 32-bit index (called HTree). But with 65,000+ items, two different names inevitably get assigned the exact same index slot (the Birthday Paradox). When that happens, the system is forced to slow down and perform a slow manual search across chained leaf blocks.</li>
+        <li><strong>The Box Never Shrinks:</strong> In ext4, when you delete papers from the giant box, the cardboard box <em>never shrinks back down</em>! If it expanded to 71 MB on disk, it stays 71 MB forever, wasting RAM cache every time someone looks inside, until you take the filesystem offline for repair.</li>
+      </ul>
+      <p>Now imagine you organize with a <strong>2-Tier Filing Cabinet</strong>:</p>
+      <ul>
+        <li>Drawer 1 (Tier 1): 256 folders labeled <code>00</code> through <code>ff</code>.</li>
+        <li>Drawer 2 (Tier 2): Inside each folder, 256 subfolders labeled <code>00</code> through <code>ff</code> (65,536 total folders).</li>
+        <li>With 1,000,000 papers, each subfolder holds an average of only <strong>15 papers</strong>!</li>
+        <li>Because 15 files easily fit inside a single 4KB block (which holds up to 56 files), the computer reads the folder in a single instant disk read ($O(1)$) with <strong>zero index splitting</strong> and <strong>zero hash collisions</strong>.</li>
+      </ul>
+    </div>
+
+    <h3>Mechanical Sizing Numbers</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>Sizing Dimension</th>
+          <th>ext4 Mechanical Value</th>
+          <th>Impact on ADR 0001 Design</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Directory Entry Header</td>
+          <td>8 bytes (inode, rec_len, name_len, file_type)</td>
+          <td>Fixed overhead per entry.</td>
+        </tr>
+        <tr>
+          <td>Filename Length</td>
+          <td>64 bytes (SHA-256 hex)</td>
+          <td>Total entry = $8 + 64 = 72$ bytes.</td>
+        </tr>
+        <tr>
+          <td>Max Entries in 4KB Block</td>
+          <td>$\lfloor (4096 - 12) / 72 \rfloor = 56$ entries</td>
+          <td>Leaf directories stay under 56 items up to ~3.6M objects/bucket!</td>
+        </tr>
+        <tr>
+          <td>Subdirectory Limit (<code>EXT4_LINK_MAX</code>)</td>
+          <td>65,000 hard links per directory</td>
+          <td>We only put 256 subdirectories per tier, safely avoiding the 65,000 ceiling.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>4. Hashed Key Addressing: Why Lowercase Hex SHA-256?</h2>
+    <p>In ADR 0001, every object key is addressed as:</p>
+    <pre><code>hash = hex_lower(SHA-256(key.getBytes(StandardCharsets.UTF_8)))</code></pre>
+
+    <p>Why this exact combination?</p>
+    <ul>
+      <li><strong>Raw UTF-8 Bytes:</strong> Cryptographic hashing functions do not operate on abstract string characters; they operate on raw byte arrays. Using explicit <code>UTF-8</code> ensures identical byte sequences across Java runtimes on Linux, Windows, or ARM servers.</li>
+      <li><strong>SHA-256 Collision Resistance:</strong> With $2^{256}$ possible outputs, the mathematical chance of two keys having the same hash is $5.8 \times 10^{-47}$ even after storing 10 billion items a day for 1,000 years. It provides mathematically guaranteed uniqueness.</li>
+      <li><strong>The Avalanche Effect:</strong> Changing a single letter (e.g. <code>photo1.jpg</code> vs <code>photo2.jpg</code>) flips 50% of the bits in the output hash. This guarantees a perfectly random and uniform distribution across the 65,536 leaf directories.</li>
+      <li><strong>Hexadecimal Encoding:</strong> The raw SHA-256 digest is 32 binary bytes, which can contain null bytes, control characters, or slashes (<code>/</code>). Hexadecimal converts this into 64 clean, safe ASCII characters (<code>0-9</code> and <code>a-f</code>).</li>
+      <li><strong>Lowercase Strictness:</strong> Linux ext4 is case-sensitive (<code>abc</code> and <code>ABC</code> are distinct files), whereas macOS APFS and Windows NTFS are case-insensitive. Standardizing on lowercase prevents subtle cross-platform corruption and file-not-found bugs.</li>
+      <li><strong>Total Immunity to CWE-22 (Path Traversal):</strong> A malicious key like <code>../../../../etc/shadow</code> hashes into <code>64-character alphanumeric string</code>. There are no dots, no slashes, and no null characters. It is physically impossible to escape the storage root.</li>
+    </ul>
+
+    <h2>5. What are MIME Types &amp; Why Are They Decoupled?</h2>
+    <p><strong>MIME</strong> (Multipurpose Internet Mail Extensions) types, formally known as <em>Media Types</em> (RFC 2046 / RFC 6838), tell clients what kind of data an object represents (e.g., <code>image/png</code>, <code>application/pdf</code>, <code>text/plain</code>, <code>video/mp4</code>).</p>
+
+    <p>In traditional desktop filesystems, the operating system guesses the file type using the file extension (like <code>.png</code> or <code>.pdf</code>). But in an S3-compatible storage engine:</p>
+    <ol>
+      <li><strong>Payloads on disk have NO extension:</strong> The disk file is named strictly by its 64-character hash:
+        <pre><code>/data/buckets/my-bucket/e3/b0/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855</code></pre>
+      </li>
+      <li><strong>The disk engine only cares about raw payload bytes:</strong> It streams bytes in and out without inspecting their format.</li>
+      <li><strong>MIME types live in the Metadata Store (Database):</strong> When an object is uploaded, its human-readable key (e.g., <code>vacation.png</code>), its MIME type (<code>image/png</code>), its size, and timestamps are recorded in the database.</li>
+      <li><strong>Serving the object:</strong> When a user requests <code>GET /my-bucket/vacation.png</code>, the service looks up the metadata in the database, sets the HTTP response header <code>Content-Type: image/png</code>, and streams the raw bytes directly off the disk.</li>
+    </ol>
+
+    <!-- Interactive Quizzes with Instant Feedback -->
+    <div class="quiz-section">
+      <div class="quiz-header">&#x1F9E0; Interactive Knowledge Check</div>
+
+      <div class="quiz-question">1. Why does ADR 0001 use 2 tiers of directories instead of placing all files in one folder?</div>
+      <div class="quiz-options" id="q1-options">
+        <button class="quiz-btn" onclick="checkAnswer(1, 0, true)">To ensure every folder fits in a single block.</button>
+        <button class="quiz-btn" onclick="checkAnswer(1, 1, false)">To maximize the total throughput of disk reads.</button>
+        <button class="quiz-btn" onclick="checkAnswer(1, 2, false)">To enforce strict permissions across all users.</button>
+        <button class="quiz-btn" onclick="checkAnswer(1, 3, false)">To prevent duplicate files from being uploaded.</button>
+      </div>
+      <div class="quiz-feedback" id="q1-feedback"></div>
+
+      <div style="margin-top: 1.5rem;" class="quiz-question">2. Why are object keys converted to lowercase hexadecimal SHA-256 digests before saving?</div>
+      <div class="quiz-options" id="q2-options">
+        <button class="quiz-btn" onclick="checkAnswer(2, 0, true)">It guarantees uniform distribution and blocks directory traversal.</button>
+        <button class="quiz-btn" onclick="checkAnswer(2, 1, false)">It compresses binary payload bytes to save local storage.</button>
+        <button class="quiz-btn" onclick="checkAnswer(2, 2, false)">It encrypts stored disk records to prevent customer theft.</button>
+        <button class="quiz-btn" onclick="checkAnswer(2, 3, false)">It speeds up network transfer speeds across public routes.</button>
+      </div>
+      <div class="quiz-feedback" id="q2-feedback"></div>
+
+      <div style="margin-top: 1.5rem;" class="quiz-question">3. Where does the object's MIME type reside in this storage engine architecture?</div>
+      <div class="quiz-options" id="q3-options">
+        <button class="quiz-btn" onclick="checkAnswer(3, 0, true)">Inside the embedded metadata database records.</button>
+        <button class="quiz-btn" onclick="checkAnswer(3, 1, false)">Within the filesystem filename extension suffix.</button>
+        <button class="quiz-btn" onclick="checkAnswer(3, 2, false)">Inside raw payload binary header bytes.</button>
+        <button class="quiz-btn" onclick="checkAnswer(3, 3, false)">Encoded within the two-tier partition paths.</button>
+      </div>
+      <div class="quiz-feedback" id="q3-feedback"></div>
+    </div>
+
+    <div class="callout">
+      <div class="callout-title">Have Questions?</div>
+      <p>I am your teacher! Ask me any follow-up questions about any part of this lesson, from low-level ext4 inode structures to SHA-256 mathematics.</p>
+    </div>
+
+    <div class="footer-nav">
+      <a href="../reference/storage-engine-cheat-sheet.html">View Cheat Sheet &rarr;</a>
+      <a href="./0002-ext4-htree-and-block-allocation.html">Next: Lesson 0002 &rarr;</a>
+    </div>
+  </div>
+
+  <script>
+    const feedbackText = {
+      1: {
+        correct: "Correct! With 65,536 leaf directories, 1,000,000 files average ~15 files per directory. Since a 4KB ext4 block holds ~56 entries of 72 bytes, the directory fits in a single block with zero HTree splitting.",
+        incorrect: "Not quite. Think about block boundaries: placing 1M files in one directory causes ext4 HTree hash collisions and bloat, while 65,536 directories keep entry counts below 56 per leaf block."
+      },
+      2: {
+        correct: "Correct! SHA-256's avalanche effect spreads files uniformly across directories, and the fixed [0-9a-f] character set completely prevents path traversal attacks (CWE-22) like '../../'.",
+        incorrect: "Not quite. SHA-256 does not compress data or encrypt payloads—it provides collision-free uniform distribution and sanitizes filenames into safe hexadecimal characters."
+      },
+      3: {
+        correct: "Correct! Decoupling metadata from raw storage means disk payloads have no file extension; the MIME type is persisted in the Metadata Store and returned via the HTTP Content-Type header.",
+        incorrect: "Not quite. In ADR 0001 Decision 4, payload files on disk are named purely by their hash without extensions. The MIME type is tracked exclusively in the Metadata Store database."
+      }
+    };
+
+    function checkAnswer(questionNum, optionIdx, isCorrect) {
+      const optionsDiv = document.getElementById(`q${questionNum}-options`);
+      const buttons = optionsDiv.getElementsByTagName('button');
+      const feedbackDiv = document.getElementById(`q${questionNum}-feedback`);
+
+      for (let i = 0; i < buttons.length; i++) {
+        buttons[i].classList.remove('correct', 'incorrect');
+        if (i === optionIdx) {
+          buttons[i].classList.add(isCorrect ? 'correct' : 'incorrect');
+        }
+      }
+
+      feedbackDiv.className = `quiz-feedback show ${isCorrect ? 'correct' : 'incorrect'}`;
+      feedbackDiv.style.backgroundColor = isCorrect ? 'rgba(26, 127, 55, 0.1)' : 'rgba(207, 34, 46, 0.1)';
+      feedbackDiv.style.color = isCorrect ? 'var(--accent-green)' : 'var(--accent-red)';
+      feedbackDiv.style.border = `1px solid ${isCorrect ? 'var(--accent-green)' : 'var(--accent-red)'}`;
+      feedbackDiv.innerHTML = isCorrect ? feedbackText[questionNum].correct : feedbackText[questionNum].incorrect;
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Lesson 0002: ext4 Blocks, HTree Collisions & Directory Internals</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <span class="lesson-tag">Lesson 0002 &bull; Low-Level Filesystem Mechanics</span>
+      <h1>ext4 Blocks, HTree Collisions &amp; Directory Internals</h1>
+      <p class="subtitle">Decoupling directory entry blocks from payload data blocks, and dissecting the two independent hashing layers.</p>
+    </header>
+
+    <div class="callout">
+      <div class="callout-title">Primary Recommended Reading</div>
+      <p>Dive into the Linux kernel source implementation of directory entry lookups and HTree B-tree index structures in <a href="https://github.com/torvalds/linux/blob/master/fs/ext4/namei.c" target="_blank">fs/ext4/namei.c (ext4_dx_find_entry)</a> and the Birthday Paradox probability model.</p>
+    </div>
+
+    <h2>1. The Two Independent Hashing Layers</h2>
+    <p>A common source of confusion when reading <a href="../docs/adr/0001-storage-engine-layout.md">ADR 0001</a> is mixing up <strong>Application-level hashing</strong> and <strong>Filesystem kernel-level hashing</strong>. They are two entirely separate systems operating at different layers:</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Layer</th>
+          <th>1. Application Layer (Storage Engine)</th>
+          <th>2. Kernel Filesystem Layer (Linux ext4)</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>What is being hashed?</strong></td>
+          <td>The user's <strong>S3 Object Key</strong> (e.g. <code>"photos/vacation.png"</code>).</td>
+          <td>The <strong>Filename on disk</strong> (e.g. <code>"e3b0c44298fc...b855"</code>).</td>
+        </tr>
+        <tr>
+          <td><strong>Hash Algorithm</strong></td>
+          <td><strong>SHA-256</strong> (FIPS 180-4 / RFC 6234).</td>
+          <td><strong>Half-MD4 or TEA</strong> (Kernel internal).</td>
+        </tr>
+        <tr>
+          <td><strong>Hash Width</strong></td>
+          <td><strong>256 bits</strong> ($2^{256} \approx 1.16 \times 10^{77}$ combinations).</td>
+          <td><strong>32 bits</strong> ($2^{32} \approx 4.29 \times 10^9$ combinations).</td>
+        </tr>
+        <tr>
+          <td><strong>Purpose</strong></td>
+          <td>Eliminate CWE-22 path traversal; uniformly distribute files across 65,536 directories.</td>
+          <td>Quickly locate which block inside a large directory holds a requested filename.</td>
+        </tr>
+        <tr>
+          <td><strong>Collision Risk</strong></td>
+          <td><strong>Virtually zero</strong> ($5.8 \times 10^{-47}$ at 10B items/day for 1,000 years).</td>
+          <td><strong>High once a directory exceeds ~65,000 entries</strong> (Birthday Paradox).</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>2. Why Do 65,000+ Files Lead to ext4 Hash Collisions?</h2>
+    <p>When a directory contains only a few files, ext4 scans the entries linearly. But when a directory grows beyond a single 4KB block, ext4 activates <strong>HTree</strong> (Hash Tree), a shallow B-tree indexing mechanism.</p>
+    
+    <p>To keep the B-tree compact and fast inside CPU cache, the Linux kernel designers chose a <strong>32-bit integer hash</strong> for filenames inside HTree.</p>
+
+    <div class="callout analogy">
+      <div class="callout-title">The Birthday Paradox in Layman Terms</div>
+      <p>In a room of just <strong>23 people</strong>, there is a 50% chance that two people share the exact same birthday (out of 365 days). You don't need 365 people to get a collision! The math depends on the number of <em>pairs</em> of people: with 23 people, there are $(23 \times 22) / 2 = 253$ possible pairings.</p>
+      <p>The mathematical rule is: collisions begin appearing around the <strong>square root</strong> of the total possible slots:</p>
+      <p style="text-align: center; font-family: var(--font-mono); font-size: 1.1rem; margin: 1rem 0;">
+        Collision Threshold &approx; &radic;(2<sup>32</sup>) = 2<sup>16</sup> = <strong>65,536 files</strong>
+      </p>
+      <p>So, even though a 32-bit hash has 4.29 billion total numbers, dumping <strong>65,000+ filenames into a single directory</strong> creates a high statistical guarantee that two completely different filenames will produce the exact same 32-bit HTree hash!</p>
+    </div>
+
+    <h3>What Does an ext4 Hash Collision Actually Mean?</h3>
+    <p>When two filenames produce the same 32-bit HTree hash:</p>
+    <ol>
+      <li><strong>Data is NOT lost or corrupted:</strong> ext4 does not overwrite files.</li>
+      <li><strong>HTree cannot pinpoint the file:</strong> The B-tree index only leads to a "bucket" of colliding entries.</li>
+      <li><strong>Performance Degrades into a Linear Scan:</strong> The kernel must chain adjacent 4KB leaf blocks together. When you ask to open or stat a file, the kernel cannot do an instant lookup; it is forced to do a slow linear scan across all chained leaf blocks, performing byte-by-byte string comparisons on the filenames.</li>
+      <li><strong>Insertion Latency Spikes:</strong> Adding new files requires splitting leaf blocks and updating the journal while holding directory locks, causing severe throughput drops.</li>
+    </ol>
+
+    <h2>3. "What If the File Size Is Above 4KB?"</h2>
+    
+    <div class="callout danger">
+      <div class="callout-title">Crucial Distinction: Directory Blocks vs. Data Blocks</div>
+      <p><strong>A directory block does NOT contain the file's payload data!</strong></p>
+      <p>Think of a directory as a <strong>Phonebook</strong>, and the file payload as a <strong>House</strong>:</p>
+      <ul>
+        <li>The phonebook entry is a single line: <code>"Name: e3b0c4... | Address: Inode #48291"</code>.</li>
+        <li>The size of the house (whether it is a 500-square-foot apartment or a 50,000-square-foot palace) has <strong>zero effect</strong> on how many lines fit on a page in the phonebook!</li>
+      </ul>
+    </div>
+
+    <div class="diagram-box">
+DIRECTORY LEAF BLOCK (4,096 bytes on disk):
+┌────────────────────────────────────────────────────────────────────────┐
+│ struct ext4_dir_entry_2 (Entry 1): Inode #101 ──> Name: a1b2... (72B)  │
+│ struct ext4_dir_entry_2 (Entry 2): Inode #102 ──> Name: c3d4... (72B)  │
+│ struct ext4_dir_entry_2 (Entry 3): Inode #103 ──> Name: e5f6... (72B)  │
+│ ... [Holds up to ~56 entries of 72 bytes] ...                          │
+└────────────────────────────────────────────────────────────────────────┘
+                                 │
+           Points to Inode #102  │
+                                 ▼
+INODE #102 (Metadata on disk):
+┌────────────────────────────────────────────────────────────────────────┐
+│ File Size: 10,485,760 bytes (10 MB)                                    │
+│ Extent Tree (Pointers to physical payload data blocks)                │
+└────────────────────────────────────────────────────────────────────────┘
+                                 │
+           Pointers to Extents   │
+                                 ▼
+DATA PAYLOAD BLOCKS (Scattered across the disk volume):
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+│ Data Block 1 │  │ Data Block 2 │  │ Data Block 3 │  │ Data Blk 2560│  ... (10 MB payload)
+│  (4,096 B)   │  │  (4,096 B)   │  │  (4,096 B)   │  │  (4,096 B)   │
+└──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘
+    </div>
+
+    <p>Notice what happens:</p>
+    <ul>
+      <li>Whether an object payload is <strong>10 bytes, 4 kilobytes, 100 megabytes, or 50 gigabytes</strong>, its directory entry inside the leaf folder is <strong>always exactly 72 bytes</strong>!</li>
+      <li>The 4KB directory block holds up to <strong>56 directory entries</strong> regardless of payload size.</li>
+      <li>At 1,000,000 objects in a bucket, each of our 65,536 leaf directories contains an average of <strong>15 directory entries</strong>.</li>
+      <li>All 15 entries consume only $15 \times 72 = 1,080\text{ bytes}$, leaving 3,004 bytes of empty room inside the leaf folder's single 4KB block.</li>
+      <li>When Linux needs to find your file, it reads just that single 4KB directory block from disk (or pulls it instantly from RAM via the Linux <code>dentry</code> cache), finds Inode #102, and immediately begins streaming the payload data blocks.</li>
+    </ul>
+
+    <!-- Interactive Quizzes with Instant Feedback -->
+    <div class="quiz-section">
+      <div class="quiz-header">&#x1F9E0; Interactive Knowledge Check</div>
+
+      <div class="quiz-question">1. If an uploaded object is 500 megabytes, how much space does its entry take inside the leaf directory?</div>
+      <div class="quiz-options" id="q1-options">
+        <button class="quiz-btn" onclick="checkAnswer(1, 0, true)">Exactly seventy-two bytes within one block.</button>
+        <button class="quiz-btn" onclick="checkAnswer(1, 1, false)">Five hundred megabytes across chained blocks.</button>
+        <button class="quiz-btn" onclick="checkAnswer(1, 2, false)">Four kilobytes allocated for new extents.</button>
+        <button class="quiz-btn" onclick="checkAnswer(1, 3, false)">One full block reserved for indexing.</button>
+      </div>
+      <div class="quiz-feedback" id="q1-feedback"></div>
+
+      <div style="margin-top: 1.5rem;" class="quiz-question">2. What causes ext4 HTree hash collisions when more than 65,000 files are in one directory?</div>
+      <div class="quiz-options" id="q2-options">
+        <button class="quiz-btn" onclick="checkAnswer(2, 0, true)">The internal thirty-two bit hash function triggers birthday collisions.</button>
+        <button class="quiz-btn" onclick="checkAnswer(2, 1, false)">The primary two-hundred-fifty-six bit SHA-256 algorithm suffers output exhaustion.</button>
+        <button class="quiz-btn" onclick="checkAnswer(2, 2, false)">The physical disk hardware corrupts random bits during write operations.</button>
+        <button class="quiz-btn" onclick="checkAnswer(2, 3, false)">The operating system runs out of unique available inode descriptors.</button>
+      </div>
+      <div class="quiz-feedback" id="q2-feedback"></div>
+    </div>
+
+    <div class="callout">
+      <div class="callout-title">Teacher's Desk</div>
+      <p>Have further questions? Ask me about how ext4 extent trees point to data blocks, or how the Linux dentry cache keeps directory blocks in RAM!</p>
+    </div>
+
+    <div class="footer-nav">
+      <a href="./0001-storage-engine-layout-and-ext4.html">&larr; Back to Lesson 0001</a>
+      <a href="../reference/storage-engine-cheat-sheet.html">View Reference Cheat Sheet &rarr;</a>
+    </div>
+  </div>
+
+  <script>
+    const feedbackText = {
+      1: {
+        correct: "Correct! The directory entry only stores the 8-byte header plus the 64-byte filename (72 bytes total). The 500MB payload data is stored in separate data blocks tracked by the inode extents.",
+        incorrect: "Not quite. Remember the phonebook analogy: the phonebook entry is always 72 bytes. The 500MB file payload resides in separate data blocks on disk, not inside the directory file."
+      },
+      2: {
+        correct: "Correct! Because ext4's internal HTree directory index uses a 32-bit hash, the Birthday Paradox guarantees hash collisions begin manifesting around &radic;(2^32) = 65,536 entries.",
+        incorrect: "Not quite. The collision is in ext4's internal 32-bit HTree filename hash, not our application-level 256-bit SHA-256 key hash."
+      }
+    };
+
+    function checkAnswer(questionNum, optionIdx, isCorrect) {
+      const optionsDiv = document.getElementById(`q${questionNum}-options`);
+      const buttons = optionsDiv.getElementsByTagName('button');
+      const feedbackDiv = document.getElementById(`q${questionNum}-feedback`);
+
+      for (let i = 0; i < buttons.length; i++) {
+        buttons[i].classList.remove('correct', 'incorrect');
+        if (i === optionIdx) {
+          buttons[i].classList.add(isCorrect ? 'correct' : 'incorrect');
+        }
+      }
+
+      feedbackDiv.className = `quiz-feedback show ${isCorrect ? 'correct' : 'incorrect'}`;
+      feedbackDiv.style.backgroundColor = isCorrect ? 'rgba(26, 127, 55, 0.1)' : 'rgba(207, 34, 46, 0.1)';
+      feedbackDiv.style.color = isCorrect ? 'var(--accent-green)' : 'var(--accent-red)';
+      feedbackDiv.style.border = `1px solid ${isCorrect ? 'var(--accent-green)' : 'var(--accent-red)'}`;
+      feedbackDiv.innerHTML = isCorrect ? feedbackText[questionNum].correct : feedbackText[questionNum].incorrect;
+    }
+  </script>
+</body>
+</html>

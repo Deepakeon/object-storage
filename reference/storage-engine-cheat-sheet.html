@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Reference: Storage Engine & ext4 Architecture Cheat Sheet</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <style>
+    @media print {
+      body { padding: 0; background: white; font-size: 12px; }
+      .container { max-width: 100%; }
+      pre, code { font-size: 11px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <span class="lesson-tag">Reference Document &bull; Storage Engine</span>
+      <h1>Storage Engine & ext4 Architecture Cheat Sheet</h1>
+      <p class="subtitle">Quick-reference specs, ext4 limits, hashing formulas, and POSIX impedance rules.</p>
+    </header>
+
+    <h2>1. Mechanical ext4 Limits & Sizing Constants</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Metric</th>
+          <th>ext4 Value</th>
+          <th>Operational Implication</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Block Size</strong></td>
+          <td><code>4,096 bytes (4 KB)</code></td>
+          <td>Standard disk allocation and directory block unit.</td>
+        </tr>
+        <tr>
+          <td><strong>Directory Entry Size</strong></td>
+          <td><code>72 bytes</code></td>
+          <td>8-byte header (<code>ext4_dir_entry_2</code>) + 64-byte SHA-256 hex filename.</td>
+        </tr>
+        <tr>
+          <td><strong>Max Entries / 4KB Block</strong></td>
+          <td><code>56 entries</code></td>
+          <td>$\lfloor (4096 - 12) / 72 \rfloor = 56$. Under 56 entries = fits in 1 block, zero HTree splitting.</td>
+        </tr>
+        <tr>
+          <td><strong>HTree Hash Width</strong></td>
+          <td><code>32-bit hash</code></td>
+          <td>Birthday paradox collision threshold: $\sqrt{2^{32}} \approx 65,536$ entries.</td>
+        </tr>
+        <tr>
+          <td><strong>Max Subdirectories</strong></td>
+          <td><code>EXT4_LINK_MAX = 65,000</code></td>
+          <td>Subdirectory count per parent directory before <code>dir_nlink</code> clamps to 1.</td>
+        </tr>
+        <tr>
+          <td><strong>Directory Deallocation</strong></td>
+          <td><strong>NEVER shrinks</strong></td>
+          <td>Unlinking files leaves allocated directory blocks intact. Manual fix: <code>e2fsck -D</code>.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>2. Hashed Key Addressing Specification</h2>
+    <div class="callout">
+      <div class="callout-title">Deterministic Addressing Formula</div>
+      <code>hash = hex_lower(SHA-256(key.getBytes(StandardCharsets.UTF_8)))</code>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>Component</th>
+          <th>Format / Value</th>
+          <th>Rationale</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Charset</strong></td>
+          <td><code>UTF-8</code></td>
+          <td>Uniform byte encoding across all OS/JVM platforms regardless of system default.</td>
+        </tr>
+        <tr>
+          <td><strong>Hash Function</strong></td>
+          <td><code>SHA-256</code></td>
+          <td>$2^{256}$ space ($5.8 \times 10^{-47}$ collision risk at 10B items/day for 1,000 yrs); avalanche bit spread.</td>
+        </tr>
+        <tr>
+          <td><strong>Encoding</strong></td>
+          <td><code>Lowercase Hex</code> (<code>[0-9a-f]{64}</code>)</td>
+          <td>Case-sensitivity safety across Linux ext4, macOS APFS, and Windows NTFS.</td>
+        </tr>
+        <tr>
+          <td><strong>Security</strong></td>
+          <td><strong>CWE-22 Immunity</strong></td>
+          <td>Guarantees no <code>../</code>, slashes, null bytes (<code>\0</code>), or control characters in payload filenames.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>3. 2-Tier Partitioning Fan-Out</h2>
+    <div class="diagram-box">
+/data/buckets/{bucket}/{hash[0:2]}/{hash[2:4]}/{hash}
+                         │            │          └─ 64-char payload file (e.g., e3b0c442...)
+                         │            └──────────── Tier 2: 256 subdirectories (00 - ff)
+                         └───────────────────────── Tier 1: 256 subdirectories (00 - ff)
+Total Leaf Directories per Bucket = 256 × 256 = 65,536 directories
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>Bucket Object Count</th>
+          <th>Avg Files / Leaf Directory</th>
+          <th>ext4 HTree Status</th>
+          <th>Dentry Cache Behavior</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>10,000</td>
+          <td>0.15</td>
+          <td>Single 4KB block (Lazy created)</td>
+          <td>Instant O(1) hit</td>
+        </tr>
+        <tr>
+          <td>100,000</td>
+          <td>1.53</td>
+          <td>Single 4KB block</td>
+          <td>Instant O(1) hit</td>
+        </tr>
+        <tr>
+          <td>1,000,000</td>
+          <td>15.26 (&lt; 56 entries)</td>
+          <td>Single 4KB block (No HTree split)</td>
+          <td>Instant O(1) hit</td>
+        </tr>
+        <tr>
+          <td>10,000,000</td>
+          <td>152.6 (&approx; 3 blocks)</td>
+          <td>Minimal 1-level HTree</td>
+          <td>High throughput, negligible latency</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>4. S3 vs POSIX Impedance & Metadata Decoupling</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Aspect</th>
+          <th>Amazon S3 Semantics</th>
+          <th>POSIX / ext4 Filesystem</th>
+          <th>ADR 0001 Resolution</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Namespace</strong></td>
+          <td>Flat string keys (opaque UTF-8 up to 1024B).</td>
+          <td>Hierarchical tree of directory nodes and files.</td>
+          <td>Hash keys to flat 64-char IDs across uniform 2-tier tree.</td>
+        </tr>
+        <tr>
+          <td><strong>File vs Dir</strong></td>
+          <td><code>photos</code> and <code>photos/pic.png</code> can coexist.</td>
+          <td>A path node cannot be both a file and directory.</td>
+          <td>Decoupled: payloads are only at leaf depth 3.</td>
+        </tr>
+        <tr>
+          <td><strong>MIME Types</strong></td>
+          <td>Supplied via HTTP <code>Content-Type</code> header.</td>
+          <td>Inferred from extensions (<code>.png</code>) or file headers.</td>
+          <td>Decoupled: stored in SQLite/H2; disk payload has no extension.</td>
+        </tr>
+        <tr>
+          <td><strong>Atomic Writes</strong></td>
+          <td>PUT is atomic last-write-wins.</td>
+          <td>Direct writes expose partial data during crashes.</td>
+          <td>Stream to <code>staging/{uuid}.tmp</code>, then atomic POSIX <code>rename()</code>.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>5. Directory Blocks vs. Data Blocks & Two Hashing Layers</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Concept</th>
+          <th>Directory Block</th>
+          <th>Data Payload Block</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>What it contains</strong></td>
+          <td>Array of directory entries (72 bytes: 8-byte header + 64-char filename).</td>
+          <td>Raw bytes of the object payload (image, video, document).</td>
+        </tr>
+        <tr>
+          <td><strong>Size impact</strong></td>
+          <td>Always 72 bytes per file entry, regardless of file size.</td>
+          <td>Grows in 4KB block multiples depending on payload size.</td>
+        </tr>
+        <tr>
+          <td><strong>Hashing applied</strong></td>
+          <td>ext4 32-bit HTree hash of filename (collides at ~65,536 entries).</td>
+          <td>Application-level 256-bit SHA-256 of S3 key ($5.8 \times 10^{-47}$ collision risk).</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="footer-nav">
+      <a href="../lessons/0001-storage-engine-layout-and-ext4.html">&larr; Lesson 0001</a>
+      <a href="../lessons/0002-ext4-htree-and-block-allocation.html">Lesson 0002 &rarr;</a>
+    </div>
+  </div>
+</body>
+</html>
